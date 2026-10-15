@@ -1,0 +1,157 @@
+name: iOS Sideload IPA
+
+# Builds an unsigned Personal Team variant of the mobile app from upstream
+# pingdotgg/t3code and publishes it as a GitHub release. Sideloading tools
+# (AltStore, SideStore, Sideloadly) sign it with the installer's Apple ID.
+# Personal Team builds omit the widget/share extensions, push, App Groups and
+# native Sign in with Apple, none of which a free Apple ID can sign.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Branch, tag or commit of pingdotgg/t3code to build
+        required: true
+        default: main
+      bundle_id:
+        description: Bundle identifier (sideloading tools may rewrite it)
+        required: true
+        default: com.techyaditya.t3code
+      t3_connect:
+        description: Enable T3 Connect using the public identifiers from .env.example
+        type: boolean
+        default: true
+
+concurrency:
+  group: ios-sideload-ipa
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  NODE_OPTIONS: --max-old-space-size=8192
+  APP_VARIANT: production
+  EXPO_NO_GIT_STATUS: "1"
+  T3CODE_IOS_PERSONAL_TEAM: "1"
+  T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: ${{ inputs.bundle_id }}
+  # Production OTA updates target store binaries and could replace this
+  # build's bundle with one speaking an older protocol.
+  T3CODE_MOBILE_UPDATES_ENABLED: "0"
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v6
+        with:
+          repository: pingdotgg/t3code
+          ref: ${{ inputs.upstream_ref }}
+          path: t3code
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Select newest Xcode
+        run: |
+          xcode="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          working-directory: t3code
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=@t3tools/mobile...
+              - --filter=@t3tools/scripts...
+
+      - name: Enable T3 Connect
+        if: inputs.t3_connect
+        working-directory: t3code
+        run: cp .env.example .env
+
+      - name: Prebuild iOS project
+        working-directory: t3code/apps/mobile
+        run: vp exec expo prebuild --clean --platform ios
+
+      - name: Build Release app
+        working-directory: t3code/apps/mobile
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace ios/T3Code.xcworkspace \
+            -scheme T3Code \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination generic/platform=iOS \
+            -derivedDataPath "$RUNNER_TEMP/derived-data" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E "error:|warning: .*deprecated|\*\* BUILD" || true
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Package IPA
+        id: package
+        run: |
+          app="$RUNNER_TEMP/derived-data/Build/Products/Release-iphoneos/T3Code.app"
+          test -x "$app/T3Code"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")"
+          sha="$(git -C t3code rev-parse --short=12 HEAD)"
+          stamp="$(date -u +%Y%m%d%H%M)"
+          work="$RUNNER_TEMP/ipa"
+          mkdir -p "$work/Payload"
+          cp -R "$app" "$work/Payload/"
+          ipa="T3-Code-$version-$stamp-$sha-unsigned.ipa"
+          (cd "$work" && zip -qry "$GITHUB_WORKSPACE/$ipa" Payload)
+          ls -lh "$ipa"
+          {
+            echo "ipa=$ipa"
+            echo "version=$version"
+            echo "sha=$sha"
+            echo "full_sha=$(git -C t3code rev-parse HEAD)"
+            echo "tag=ios-$version-$stamp-$sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IPA: ${{ steps.package.outputs.ipa }}
+          TAG: ${{ steps.package.outputs.tag }}
+          VERSION: ${{ steps.package.outputs.version }}
+          SHA: ${{ steps.package.outputs.sha }}
+          FULL_SHA: ${{ steps.package.outputs.full_sha }}
+          REF: ${{ inputs.upstream_ref }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          T3_CONNECT: ${{ inputs.t3_connect }}
+        run: |
+          cat > notes.md <<EOF
+          Unsigned sideload build of T3 Code Mobile $VERSION.
+
+          - Source: [pingdotgg/t3code@$SHA](https://github.com/pingdotgg/t3code/commit/$FULL_SHA) (\`$REF\`)
+          - Bundle ID: \`$BUNDLE_ID\`
+          - T3 Connect: $T3_CONNECT
+          - Personal Team variant: no widgets, share extension, push notifications or native Sign in with Apple. OTA updates disabled.
+
+          Install with AltStore, SideStore or Sideloadly, which sign the IPA with your Apple ID.
+          EOF
+          gh release create "$TAG" "$IPA" \
+            --target "$GITHUB_SHA" \
+            --title "T3 Code iOS $VERSION ($SHA)" \
+            --notes-file notes.md
