@@ -5,13 +5,20 @@ name: iOS Sideload IPA
 # (AltStore, SideStore, Sideloadly) sign it with the installer's Apple ID.
 # Personal Team builds omit the widget/share extensions, push, App Groups and
 # native Sign in with Apple, none of which a free Apple ID can sign.
+#
+# Hourly runs mirror upstream into this fork's main branch and build the newest
+# upstream release (nightlies included) unless it already has an IPA release.
+# This workflow lives on the fork's default branch rather than main because the
+# Actions token cannot push upstream workflow changes onto a diverged branch.
 on:
+  schedule:
+    - cron: "41 * * * *"
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: Branch, tag or commit of pingdotgg/t3code to build
-        required: true
-        default: main
+        description: Branch, tag or commit of pingdotgg/t3code (empty = newest release)
+        required: false
+        default: ""
       bundle_id:
         description: Bundle identifier (sideloading tools may rewrite it)
         required: true
@@ -20,6 +27,10 @@ on:
         description: Enable T3 Connect using the public identifiers from .env.example
         type: boolean
         default: true
+      force:
+        description: Rebuild even if a release for this upstream tag exists
+        type: boolean
+        default: false
 
 concurrency:
   group: ios-sideload-ipa
@@ -29,26 +40,78 @@ permissions:
   contents: write
 
 env:
-  NODE_OPTIONS: --max-old-space-size=8192
-  APP_VARIANT: production
-  EXPO_NO_GIT_STATUS: "1"
-  T3CODE_IOS_PERSONAL_TEAM: "1"
-  T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: ${{ inputs.bundle_id }}
-  # Production OTA updates target store binaries and could replace this
-  # build's bundle with one speaking an older protocol.
-  T3CODE_MOBILE_UPDATES_ENABLED: "0"
+  UPSTREAM: pingdotgg/t3code
 
 jobs:
+  resolve:
+    name: Sync fork and resolve upstream release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build: ${{ steps.resolve.outputs.build }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+    steps:
+      - name: Sync main with upstream
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main
+
+      - id: resolve
+        name: Resolve release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.upstream_ref }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ -n "$INPUT_REF" ]; then
+            ref="$INPUT_REF"
+            if gh release view "$ref" -R "$UPSTREAM" >/dev/null 2>&1; then
+              upstream_tag="$ref"
+            else
+              upstream_tag=""
+            fi
+          else
+            upstream_tag="$(gh release list -R "$UPSTREAM" -L 1 --exclude-drafts --json tagName --jq '.[0].tagName')"
+            ref="$upstream_tag"
+          fi
+
+          build=true
+          if [ -n "$upstream_tag" ] && [ "$FORCE" != "true" ] \
+            && gh release view "ios-$upstream_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            build=false
+            echo "ios-$upstream_tag already published; nothing to build."
+          fi
+
+          echo "Upstream ref: $ref (release tag: ${upstream_tag:-none}), build: $build"
+          {
+            echo "build=$build"
+            echo "ref=$ref"
+            echo "upstream_tag=$upstream_tag"
+          } >> "$GITHUB_OUTPUT"
+
   build:
     name: Build unsigned IPA
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
     runs-on: macos-26
     timeout-minutes: 150
+    env:
+      NODE_OPTIONS: --max-old-space-size=8192
+      APP_VARIANT: production
+      EXPO_NO_GIT_STATUS: "1"
+      T3CODE_IOS_PERSONAL_TEAM: "1"
+      T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: ${{ inputs.bundle_id || 'com.techyaditya.t3code' }}
+      # Production OTA updates target store binaries and could replace this
+      # build's bundle with one speaking an older protocol.
+      T3CODE_MOBILE_UPDATES_ENABLED: "0"
     steps:
       - name: Checkout upstream
         uses: actions/checkout@v6
         with:
-          repository: pingdotgg/t3code
-          ref: ${{ inputs.upstream_ref }}
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.resolve.outputs.ref }}
           path: t3code
           sparse-checkout: |
             /*
@@ -73,7 +136,7 @@ jobs:
               - --filter=@t3tools/scripts...
 
       - name: Enable T3 Connect
-        if: inputs.t3_connect
+        if: github.event_name == 'schedule' || inputs.t3_connect
         working-directory: t3code
         run: cp .env.example .env
 
@@ -95,29 +158,37 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E "error:|warning: .*deprecated|\*\* BUILD" || true
-          test "${PIPESTATUS[0]}" -eq 0
+            build > "$RUNNER_TEMP/xcodebuild.log" 2>&1 || status=$?
+          grep -E "error:|\*\* BUILD" "$RUNNER_TEMP/xcodebuild.log" || true
+          exit "${status:-0}"
 
       - name: Package IPA
         id: package
+        env:
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
         run: |
           app="$RUNNER_TEMP/derived-data/Build/Products/Release-iphoneos/T3Code.app"
           test -x "$app/T3Code"
-          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")"
           sha="$(git -C t3code rev-parse --short=12 HEAD)"
-          stamp="$(date -u +%Y%m%d%H%M)"
+          if [ -n "$UPSTREAM_TAG" ]; then
+            label="${UPSTREAM_TAG#v}"
+            tag="ios-$UPSTREAM_TAG"
+          else
+            label="$(date -u +%Y%m%d%H%M)-$sha"
+            tag="ios-$label"
+          fi
           work="$RUNNER_TEMP/ipa"
           mkdir -p "$work/Payload"
           cp -R "$app" "$work/Payload/"
-          ipa="T3-Code-$version-$stamp-$sha-unsigned.ipa"
+          ipa="T3-Code-iOS-$label-unsigned.ipa"
           (cd "$work" && zip -qry "$GITHUB_WORKSPACE/$ipa" Payload)
           ls -lh "$ipa"
           {
             echo "ipa=$ipa"
-            echo "version=$version"
+            echo "label=$label"
+            echo "tag=$tag"
             echo "sha=$sha"
             echo "full_sha=$(git -C t3code rev-parse HEAD)"
-            echo "tag=ios-$version-$stamp-$sha"
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload build log
@@ -134,24 +205,29 @@ jobs:
           GH_REPO: ${{ github.repository }}
           IPA: ${{ steps.package.outputs.ipa }}
           TAG: ${{ steps.package.outputs.tag }}
-          VERSION: ${{ steps.package.outputs.version }}
+          LABEL: ${{ steps.package.outputs.label }}
           SHA: ${{ steps.package.outputs.sha }}
           FULL_SHA: ${{ steps.package.outputs.full_sha }}
-          REF: ${{ inputs.upstream_ref }}
-          BUNDLE_ID: ${{ inputs.bundle_id }}
-          T3_CONNECT: ${{ inputs.t3_connect }}
+          REF: ${{ needs.resolve.outputs.ref }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
         run: |
+          if [ -n "$UPSTREAM_TAG" ]; then
+            source_line="Upstream release: [$UPSTREAM_TAG](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG) ([\`$SHA\`](https://github.com/$UPSTREAM/commit/$FULL_SHA))"
+          else
+            source_line="Source: [\`$SHA\`](https://github.com/$UPSTREAM/commit/$FULL_SHA) (\`$REF\`)"
+          fi
           cat > notes.md <<EOF
-          Unsigned sideload build of T3 Code Mobile $VERSION.
+          Unsigned sideload build of T3 Code Mobile.
 
-          - Source: [pingdotgg/t3code@$SHA](https://github.com/pingdotgg/t3code/commit/$FULL_SHA) (\`$REF\`)
-          - Bundle ID: \`$BUNDLE_ID\`
-          - T3 Connect: $T3_CONNECT
+          - $source_line
+          - Bundle ID: \`$T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID\`
           - Personal Team variant: no widgets, share extension, push notifications or native Sign in with Apple. OTA updates disabled.
 
           Install with AltStore, SideStore or Sideloadly, which sign the IPA with your Apple ID.
           EOF
+          gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true
           gh release create "$TAG" "$IPA" \
             --target "$GITHUB_SHA" \
-            --title "T3 Code iOS $VERSION ($SHA)" \
-            --notes-file notes.md
+            --title "T3 Code iOS $LABEL" \
+            --notes-file notes.md \
+            --latest
