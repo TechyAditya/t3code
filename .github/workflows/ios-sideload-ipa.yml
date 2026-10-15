@@ -191,6 +191,14 @@ jobs:
             echo "full_sha=$(git -C t3code rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.ipa }}
+          path: ${{ steps.package.outputs.ipa }}
+          compression-level: 0
+          retention-days: 14
+
       - name: Upload build log
         if: failure()
         uses: actions/upload-artifact@v7
@@ -225,9 +233,12 @@ jobs:
 
           Install with AltStore, SideStore or Sideloadly, which sign the IPA with your Apple ID.
           EOF
+          # The Actions token may not tag a commit whose workflow files differ
+          # from the default branch, so tag its current head.
+          target="$(gh api "repos/$GH_REPO" --jq .default_branch)"
           gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true
           gh release create "$TAG" "$IPA" \
-            --target "$GITHUB_SHA" \
+            --target "$target" \
             --title "T3 Code iOS $LABEL" \
             --notes-file notes.md \
             --latest
